@@ -10,35 +10,53 @@ use zeroize::Zeroizing;
 
 use crate::{ConnectionId, PacketNumber};
 
+/// X25519 椭圆曲线公钥长度（32 字节）
 pub const X25519_PUBLIC_KEY_LEN: usize = 32;
+/// ChaCha20-Poly1305 AEAD 对称密钥长度（32 字节）
 pub const AEAD_KEY_LEN: usize = 32;
+/// Poly1305 认证标签（Tag）长度（16 字节）
 pub const AEAD_TAG_LEN: usize = 16;
+/// 每个数据包加密时使用的 Nonce 长度（12 字节：4 字节盐值 + 8 字节包号）
 pub const PACKET_NONCE_LEN: usize = 12;
+/// 握手 Finished 校验标签长度（16 字节）
 pub const FINISHED_TAG_LEN: usize = 16;
+/// 防重放滑动窗口大小（4096 个包）
 pub const REPLAY_WINDOW_SIZE: usize = 4096;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// 通信端点在密码学协商中的角色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoRole {
     Client,
     Server,
 }
 
+/// 重放保护检测错误类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayError {
+    /// 重复的数据包（已被记录过）
     Duplicate,
+    /// 数据包序号过旧，已落后于当前滑动窗口左边界
     TooOld,
 }
 
+/// 密码学处理错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
+    /// 安全随机数生成器不可用
     RandomnessUnavailable,
+    /// 对端提供的公钥在低阶子群或无效
     InvalidPeerPublicKey,
+    /// ECDH 密钥协商得到的共享密钥无效（全零点）
     InvalidSharedSecret,
+    /// HKDF 密钥派生失败
     KeyDerivationFailed,
+    /// Poly1305 AEAD 密文认证失败（数据被篡改或密钥不匹配）
     AuthenticationFailed,
+    /// 防重放检测失败（重复包或过期包）
     Replay(ReplayError),
+    /// 加密载荷长度小于认证标签所需长度（小于 16 字节）
     EncryptedPayloadTooShort,
 }
 
@@ -61,6 +79,7 @@ impl fmt::Display for CryptoError {
 
 impl Error for CryptoError {}
 
+/// 临时 X25519 密钥对，用于 ECDH 前向安全密钥交换
 pub struct EphemeralKeyPair {
     secret: StaticSecret,
     public_key: [u8; X25519_PUBLIC_KEY_LEN],
@@ -75,6 +94,7 @@ impl fmt::Debug for EphemeralKeyPair {
 }
 
 impl EphemeralKeyPair {
+    /// 借助系统安全随机源生成新的临时密钥对
     pub fn generate() -> Result<Self, CryptoError> {
         let mut secret_bytes = Zeroizing::new([0_u8; X25519_PUBLIC_KEY_LEN]);
         getrandom::fill(&mut *secret_bytes).map_err(|_| CryptoError::RandomnessUnavailable)?;
@@ -83,16 +103,19 @@ impl EphemeralKeyPair {
         Ok(Self { secret, public_key })
     }
 
+    /// 获取公钥切片
     pub const fn public_key(&self) -> [u8; X25519_PUBLIC_KEY_LEN] {
         self.public_key
     }
 
+    /// 与对端公钥计算 ECDH 共享密钥（全零弱密钥将被拒绝）
     pub fn agree(
         &self,
         peer_public_key: [u8; X25519_PUBLIC_KEY_LEN],
     ) -> Result<[u8; X25519_PUBLIC_KEY_LEN], CryptoError> {
         let peer = PublicKey::from(peer_public_key);
         let shared_secret = self.secret.diffie_hellman(&peer).to_bytes();
+        // 拒绝可能因弱公钥导致的全零共享密钥
         if shared_secret == [0_u8; X25519_PUBLIC_KEY_LEN] {
             return Err(CryptoError::InvalidPeerPublicKey);
         }
@@ -100,11 +123,16 @@ impl EphemeralKeyPair {
     }
 }
 
+/// 派生出的会话双向密钥集，内部自动执行内存擦除（Zeroize）
 #[derive(Clone)]
 pub struct SessionKeys {
+    /// 客户端发往服务端的 AEAD 密钥
     client_to_server: Zeroizing<[u8; AEAD_KEY_LEN]>,
+    /// 服务端发往客户端的 AEAD 密钥
     server_to_client: Zeroizing<[u8; AEAD_KEY_LEN]>,
+    /// 用于计算握手 Finished 标签的 HMAC 密钥
     finished: Zeroizing<[u8; AEAD_KEY_LEN]>,
+    /// 用于 Nonce 前缀混合的 4 字节静态盐值
     nonce_salt: Zeroizing<[u8; 4]>,
 }
 
@@ -119,6 +147,7 @@ impl fmt::Debug for SessionKeys {
     }
 }
 
+/// 计算握手转录摘要（Transcript Hash），绑定连接 ID、两端 Nonce 及公钥
 pub fn handshake_transcript_hash(
     connection_id: ConnectionId,
     client_nonce: &[u8; 16],
@@ -136,6 +165,7 @@ pub fn handshake_transcript_hash(
     hasher.finalize().into()
 }
 
+/// 基于 ECDH 共享密钥和握手转录摘要，使用 HKDF-SHA256 派生会话密钥集
 pub fn derive_session_keys(
     shared_secret: &[u8; X25519_PUBLIC_KEY_LEN],
     transcript_hash: &[u8; 32],
@@ -143,11 +173,13 @@ pub fn derive_session_keys(
     if *shared_secret == [0_u8; X25519_PUBLIC_KEY_LEN] {
         return Err(CryptoError::InvalidSharedSecret);
     }
+    // HKDF 提取阶段：以 transcript_hash 为 salt，shared_secret 为 IKM
     let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), shared_secret);
     let mut client_to_server = [0_u8; AEAD_KEY_LEN];
     let mut server_to_client = [0_u8; AEAD_KEY_LEN];
     let mut finished = [0_u8; AEAD_KEY_LEN];
     let mut nonce_salt = [0_u8; 4];
+    // 扩展派生各个定向密钥与盐值
     hkdf.expand(b"udp-protocol/v2/client-to-server", &mut client_to_server)
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
     hkdf.expand(b"udp-protocol/v2/server-to-client", &mut server_to_client)
@@ -165,6 +197,7 @@ pub fn derive_session_keys(
 }
 
 impl SessionKeys {
+    /// 计算指定角色的握手 Finished 验证标签
     pub fn finished_tag(
         &self,
         role: CryptoRole,
@@ -184,6 +217,7 @@ impl SessionKeys {
         Ok(tag)
     }
 
+    /// 使用恒定时间比较校验对端发来的 Finished 标签，防止时序侧信道攻击
     pub fn verify_finished(
         &self,
         role: CryptoRole,
@@ -197,6 +231,7 @@ impl SessionKeys {
         Ok(())
     }
 
+    /// 获取本机出方向加密密钥
     fn outbound_key(&self, role: CryptoRole) -> &[u8; AEAD_KEY_LEN] {
         match role {
             CryptoRole::Client => &self.client_to_server,
@@ -204,6 +239,7 @@ impl SessionKeys {
         }
     }
 
+    /// 获取本机入方向解密密钥
     fn inbound_key(&self, role: CryptoRole) -> &[u8; AEAD_KEY_LEN] {
         match role {
             CryptoRole::Client => &self.server_to_client,
@@ -211,6 +247,7 @@ impl SessionKeys {
         }
     }
 
+    /// 组合 4 字节盐值和 8 字节包号构成 12 字节的数据包 Nonce
     fn packet_nonce(&self, packet_number: PacketNumber) -> [u8; PACKET_NONCE_LEN] {
         let mut nonce = [0_u8; PACKET_NONCE_LEN];
         nonce[..self.nonce_salt.len()].copy_from_slice(&*self.nonce_salt);
@@ -219,9 +256,12 @@ impl SessionKeys {
     }
 }
 
+/// 4096 位防重放位图滑动窗口
 #[derive(Clone, Debug)]
 pub struct ReplayWindow {
+    /// 迄今为止接收到的最高数据包序号
     highest: Option<u64>,
+    /// 4096 位位图数组（64 个 u64，第 0 位代表 highest 包号）
     bits: [u64; REPLAY_WINDOW_SIZE / 64],
 }
 
@@ -232,6 +272,7 @@ impl Default for ReplayWindow {
 }
 
 impl ReplayWindow {
+    /// 创建初始防重放窗口
     pub const fn new() -> Self {
         Self {
             highest: None,
@@ -239,28 +280,37 @@ impl ReplayWindow {
         }
     }
 
+    /// 获取当前窗口已确认的最高包号
     pub fn highest(&self) -> Option<PacketNumber> {
         self.highest.map(PacketNumber::new)
     }
 
+    /// 检查包号是否重放并在位图中标记已接收
     pub fn check_and_mark(&mut self, packet_number: PacketNumber) -> Result<(), ReplayError> {
         let value = packet_number.raw();
+        // 1. 首包处理：直接初始化 highest 并置位首 bit
         let Some(highest) = self.highest else {
             self.highest = Some(value);
             self.bits[0] = 1;
             return Ok(());
         };
+
+        // 2. 新包序号超过最高序号：向前移动滑动窗口
         if value > highest {
             let shift = usize::try_from(value - highest).unwrap_or(REPLAY_WINDOW_SIZE);
             if shift >= REPLAY_WINDOW_SIZE {
+                // 超出整个窗口长度，清空所有历史标记
                 self.bits = [0; REPLAY_WINDOW_SIZE / 64];
             } else {
+                // 窗口位图右移 shift 位
                 self.shift_older_bits(shift);
             }
             self.highest = Some(value);
             self.bits[0] |= 1;
             return Ok(());
         }
+
+        // 3. 包序号在最高序号之前：检查是否在窗口范围内
         let distance = usize::try_from(highest - value).unwrap_or(REPLAY_WINDOW_SIZE);
         if distance >= REPLAY_WINDOW_SIZE {
             return Err(ReplayError::TooOld);
@@ -274,6 +324,7 @@ impl ReplayWindow {
         Ok(())
     }
 
+    /// 将旧位图向后平移 `shift` 个 bit
     fn shift_older_bits(&mut self, shift: usize) {
         let word_shift = shift / 64;
         let bit_shift = shift % 64;
@@ -282,6 +333,7 @@ impl ReplayWindow {
             let mut value = 0_u64;
             if index >= word_shift {
                 value = old[index - word_shift] << bit_shift;
+                // 处理跨 64 位 word 的进位/截断
                 if bit_shift != 0 && index > word_shift {
                     value |= old[index - word_shift - 1] >> (64 - bit_shift);
                 }
@@ -291,6 +343,7 @@ impl ReplayWindow {
     }
 }
 
+/// 维护单个会话的加密器上下文（包含通信角色、密钥对及防重放窗口）
 pub struct PacketCrypto {
     role: CryptoRole,
     keys: SessionKeys,
@@ -308,6 +361,7 @@ impl fmt::Debug for PacketCrypto {
 }
 
 impl PacketCrypto {
+    /// 构造新的数据包密码学上下文
     pub fn new(role: CryptoRole, keys: SessionKeys) -> Self {
         Self {
             role,
@@ -316,10 +370,12 @@ impl PacketCrypto {
         }
     }
 
+    /// 获取本机当前角色
     pub const fn role(&self) -> CryptoRole {
         self.role
     }
 
+    /// 计算握手完成标签
     pub fn finished_tag(
         &self,
         role: CryptoRole,
@@ -328,6 +384,7 @@ impl PacketCrypto {
         self.keys.finished_tag(role, transcript_hash)
     }
 
+    /// 使用 ChaCha20-Poly1305 加密数据包明文并附加 16 字节 Tag
     pub(crate) fn seal(
         &self,
         packet_number: PacketNumber,
@@ -337,6 +394,7 @@ impl PacketCrypto {
         let cipher = ChaCha20Poly1305::new(Key::from_slice(self.keys.outbound_key(self.role)));
         let nonce = self.keys.packet_nonce(packet_number);
         let mut ciphertext = plaintext.to_vec();
+        // 原地加密并生成独立认证标签
         let tag = cipher
             .encrypt_in_place_detached(Nonce::from_slice(&nonce), associated_data, &mut ciphertext)
             .map_err(|_| CryptoError::AuthenticationFailed)?;
@@ -344,6 +402,7 @@ impl PacketCrypto {
         Ok(ciphertext)
     }
 
+    /// 使用 ChaCha20-Poly1305 解密数据包密文并进行防重放检测
     pub(crate) fn open(
         &mut self,
         packet_number: PacketNumber,
@@ -353,10 +412,12 @@ impl PacketCrypto {
         if ciphertext.len() < AEAD_TAG_LEN {
             return Err(CryptoError::EncryptedPayloadTooShort);
         }
+        // 分割密文主体与末尾 16 字节 Poly1305 Tag
         let (ciphertext, tag) = ciphertext.split_at(ciphertext.len() - AEAD_TAG_LEN);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(self.keys.inbound_key(self.role)));
         let nonce = self.keys.packet_nonce(packet_number);
         let mut plaintext = ciphertext.to_vec();
+        // 校验 AAD 与 Tag 并就地解密
         cipher
             .decrypt_in_place_detached(
                 Nonce::from_slice(&nonce),
@@ -365,12 +426,14 @@ impl PacketCrypto {
                 Tag::from_slice(tag),
             )
             .map_err(|_| CryptoError::AuthenticationFailed)?;
+        // 解密成功后才标记并检测防重放窗口
         self.replay
             .check_and_mark(packet_number)
             .map_err(CryptoError::Replay)?;
         Ok(plaintext)
     }
 }
+
 
 #[cfg(test)]
 mod tests {

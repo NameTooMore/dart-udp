@@ -6,96 +6,148 @@ use crate::{
     varint,
 };
 
+/// 单个帧体最大允许长度（64KB - 1）
 pub const MAX_FRAME_BODY_LEN: usize = u16::MAX as usize;
+/// 握手 Cookie 最大长度（128 字节）
 pub const MAX_COOKIE_LEN: usize = 128;
+/// 连接关闭原因字符串最大长度（1024 字节）
 pub const MAX_CLOSE_REASON_LEN: usize = 1024;
+/// Retry 帧 Cookie 最大长度（64 字节）
 pub const MAX_RETRY_COOKIE_LEN: usize = 64;
+/// 握手随机数 Nonce 长度（16 字节）
 pub const NONCE_LEN: usize = 16;
 
+/// 客户端握手发起帧
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHello {
+    /// 客户端生成的 16 字节随机数
     pub client_nonce: [u8; NONCE_LEN],
+    /// 客户端 X25519 临时公钥（32 字节）
     pub client_public_key: [u8; X25519_PUBLIC_KEY_LEN],
+    /// 声明的最大 UDP 数据报大小
     pub max_datagram_size: u16,
+    /// 允许并发打开的最大流数量
     pub max_streams: u32,
+    /// 初始连接级流量控制窗口大小
     pub initial_connection_window: u64,
+    /// 初始单流级流量控制窗口大小
     pub initial_stream_window: u64,
+    /// 服务端下发的握手 Cookie（首次通常为空）
     pub cookie: Vec<u8>,
 }
 
+/// 服务端握手响应帧
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerHello {
+    /// 服务端生成的 16 字节随机数
     pub server_nonce: [u8; NONCE_LEN],
+    /// 服务端 X25519 临时公钥（32 字节）
     pub server_public_key: [u8; X25519_PUBLIC_KEY_LEN],
+    /// 服务端握手完成验证标签（HMAC-SHA256 截断）
     pub server_finished: [u8; FINISHED_TAG_LEN],
+    /// 声明的最大 UDP 数据报大小
     pub max_datagram_size: u16,
+    /// 允许并发打开的最大流数量
     pub max_streams: u32,
+    /// 初始连接级流量控制窗口大小
     pub initial_connection_window: u64,
+    /// 初始单流级流量控制窗口大小
     pub initial_stream_window: u64,
+    /// 服务端分配的会话 Cookie
     pub cookie: Vec<u8>,
 }
 
+/// 客户端握手确认帧（完成三向握手）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAck {
+    /// 回显服务端的会话 Cookie
     pub cookie: Vec<u8>,
+    /// 客户端握手完成验证标签
     pub client_finished: [u8; FINISHED_TAG_LEN],
 }
 
+/// 服务端重试帧（无状态校验 Cookie）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Retry {
+    /// 重试校验 Cookie
     pub cookie: Vec<u8>,
 }
 
+/// 打开新流帧
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamOpen {
+    /// 新流 ID
     pub stream_id: StreamId,
+    /// 初始接收流量控制窗口
     pub initial_receive_window: u64,
+    /// 是否为双向流（true 为双向，false 为单向）
     pub bidirectional: bool,
 }
 
+/// 流数据传输帧
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamData {
+    /// 所属流 ID
     pub stream_id: StreamId,
+    /// 本段数据在流中的起始字节偏移
     pub offset: u64,
+    /// 是否为流的结束标志（FIN）
     pub fin: bool,
+    /// 载荷应用数据
     pub data: Vec<u8>,
 }
 
+/// 流重置/异常终止帧
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetStream {
+    /// 目标流 ID
     pub stream_id: StreamId,
+    /// 应用程序或协议错误码
     pub error_code: u32,
+    /// 流终止时的最终累计发送字节数偏移
     pub final_offset: u64,
 }
 
+/// 单流流量控制窗口更新帧
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaxStreamData {
+    /// 目标流 ID
     pub stream_id: StreamId,
+    /// 允许该流发送的最大绝对字节偏移
     pub max_offset: u64,
 }
 
+/// 连接级流量控制窗口更新帧
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaxData {
+    /// 允许整条连接上所有流累计发送的最大绝对字节偏移
     pub max_offset: u64,
 }
 
+/// 心跳/保活探针请求帧
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ping {
     pub nonce: u64,
 }
 
+/// 心跳响应帧（原样返回 Ping 中的 nonce）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pong {
     pub nonce: u64,
 }
 
+/// 连接关闭通知帧
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionClose {
+    /// 关闭错误码
     pub error_code: u32,
+    /// 触发关闭的异常帧类型（若有）
     pub frame_type: u8,
+    /// 人类可读的关闭原因描述
     pub reason: String,
 }
 
+/// 协议帧枚举，包含所有控制与数据传输类型
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     ClientHello(ClientHello),
@@ -114,10 +166,12 @@ pub enum Frame {
 }
 
 impl Frame {
+    /// 判断该帧是否要求对端必须回复 ACK（除 ACK 和 Retry 外，均需确认）
     pub fn is_ack_eliciting(&self) -> bool {
         !matches!(self, Self::Ack(_) | Self::Retry(_))
     }
 
+    /// 获取帧的单字节类型标识编码
     pub(crate) fn type_code(&self) -> u8 {
         match self {
             Self::ClientHello(_) => 1,
@@ -136,6 +190,7 @@ impl Frame {
         }
     }
 
+    /// 将整帧（类型标识 + 变长帧体长度 + 帧体）编码追加至输出缓冲
     pub(crate) fn encode(&self, output: &mut Vec<u8>) -> Result<(), ProtocolError> {
         let mut body = Vec::new();
         self.encode_body(&mut body)?;
@@ -151,6 +206,7 @@ impl Frame {
         Ok(())
     }
 
+    /// 根据帧类型码和帧体字节切片解码为具体的 Frame 枚举项
     pub(crate) fn decode(frame_type: u8, body: &[u8]) -> Result<Self, ProtocolError> {
         let mut reader = Reader::new(body);
         let frame = match frame_type {
@@ -169,10 +225,12 @@ impl Frame {
             12 => Self::ConnectionClose(ConnectionClose::decode(&mut reader)?),
             value => return Err(ProtocolError::UnknownFrameType { value }),
         };
+        // 确保帧体字节完全消费完毕，没有遗留脏数据
         reader.finish()?;
         Ok(frame)
     }
 
+    /// 编码帧体内部各字段
     fn encode_body(&self, output: &mut Vec<u8>) -> Result<(), ProtocolError> {
         match self {
             Self::ClientHello(value) => value.encode(output),
@@ -354,6 +412,7 @@ impl StreamData {
             },
             data: reader.read_blob(MAX_FRAME_BODY_LEN, "stream data")?,
         };
+        // 校验 offset + data.len() 不产生 u64 溢出
         value
             .offset
             .checked_add(value.data.len() as u64)
@@ -460,6 +519,7 @@ impl ConnectionClose {
     }
 }
 
+/// 校验握手协商参数的合法性
 fn validate_hello(
     max_datagram_size: u16,
     max_streams: u32,
@@ -489,6 +549,7 @@ fn validate_hello(
     Ok(())
 }
 
+/// 写入带长度前缀的变长二进制块（varint 长度 + 实际字节）
 fn write_blob(output: &mut Vec<u8>, bytes: &[u8], maximum: usize) -> Result<(), ProtocolError> {
     if bytes.len() > maximum {
         return Err(ProtocolError::FrameTooLarge {
@@ -501,6 +562,7 @@ fn write_blob(output: &mut Vec<u8>, bytes: &[u8], maximum: usize) -> Result<(), 
     Ok(())
 }
 
+/// 帧解析字节流游标读取辅助器
 struct Reader<'a> {
     input: &'a [u8],
     offset: usize,
@@ -511,6 +573,7 @@ impl<'a> Reader<'a> {
         Self { input, offset: 0 }
     }
 
+    /// 读取 1 字节
     fn read_u8(&mut self) -> Result<u8, ProtocolError> {
         let byte = *self
             .input
@@ -520,16 +583,19 @@ impl<'a> Reader<'a> {
         Ok(byte)
     }
 
+    /// 读取大端 16 位整数
     fn read_u16(&mut self) -> Result<u16, ProtocolError> {
         let bytes = self.read_exact(2, "u16")?;
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
+    /// 读取大端 32 位整数
     fn read_u32(&mut self) -> Result<u32, ProtocolError> {
         let bytes = self.read_exact(4, "u32")?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    /// 读取大端 64 位整数
     fn read_u64(&mut self) -> Result<u64, ProtocolError> {
         let bytes = self.read_exact(8, "u64")?;
         Ok(u64::from_be_bytes([
@@ -537,10 +603,12 @@ impl<'a> Reader<'a> {
         ]))
     }
 
+    /// 读取 62 位变长整数
     fn read_varint(&mut self) -> Result<u64, ProtocolError> {
         varint::decode(self.input, &mut self.offset)
     }
 
+    /// 读取定长字节数组
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N], ProtocolError> {
         let bytes = self.read_exact(N, "fixed-size field")?;
         let mut output = [0; N];
@@ -548,6 +616,7 @@ impl<'a> Reader<'a> {
         Ok(output)
     }
 
+    /// 读取带长度前缀的变长二进制块
     fn read_blob(
         &mut self,
         maximum: usize,
@@ -567,6 +636,7 @@ impl<'a> Reader<'a> {
         Ok(self.read_exact(length, context)?.to_vec())
     }
 
+    /// 精确读取指定长度切片并推进游标
     fn read_exact(
         &mut self,
         length: usize,
@@ -584,6 +654,7 @@ impl<'a> Reader<'a> {
         Ok(bytes)
     }
 
+    /// 校验输入切片已全量消费，无剩余尾部未解析字节
     fn finish(&self) -> Result<(), ProtocolError> {
         if self.offset == self.input.len() {
             Ok(())
@@ -594,6 +665,7 @@ impl<'a> Reader<'a> {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

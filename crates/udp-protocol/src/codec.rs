@@ -10,9 +10,14 @@ use crate::{
     varint,
 };
 
+/// 默认最大 UDP 数据报大小（1200 字节，符合以太网及 IPv6 最小 MTU 安全限制）
 pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
+/// 单个数据包中允许包含的最大帧数量（防止拒绝服务或畸形报文）
 pub const MAX_FRAME_COUNT: usize = 64;
 
+/// 明文编码数据包
+///
+/// 校验未设置 ENCRYPTED 标志，将帧序列化为载荷，构造报头并计算填入 CRC32C 校验和。
 pub fn encode_packet(packet: &Packet, max_datagram_size: usize) -> Result<Vec<u8>, ProtocolError> {
     if packet.flags.contains(PacketFlags::ENCRYPTED) {
         return Err(ProtocolError::EncryptionNotAllowed);
@@ -21,6 +26,12 @@ pub fn encode_packet(packet: &Packet, max_datagram_size: usize) -> Result<Vec<u8
     encode_raw_packet(packet, packet.flags, &payload, max_datagram_size)
 }
 
+/// 使用密码学上下文加密并编码数据包
+///
+/// 1. 序列化所有帧得到明文
+/// 2. 自动附加 ENCRYPTED 标志并构造 30 字节定长报头
+/// 3. 将报头（校验和位置零）作为关联数据（AAD），使用 ChaCha20-Poly1305 加密载荷
+/// 4. 计算整包（含密文）的 CRC32C 并填入报头第 26..30 字节
 pub fn encode_packet_with_crypto(
     packet: &Packet,
     max_datagram_size: usize,
@@ -29,6 +40,7 @@ pub fn encode_packet_with_crypto(
     if packet.flags.contains(PacketFlags::ENCRYPTED) {
         return Err(ProtocolError::EncryptionNotAllowed);
     }
+    // 1. 序列化帧得到明文
     let plaintext = encode_frames(packet)?;
     let encrypted_payload_len =
         plaintext
@@ -45,6 +57,8 @@ pub fn encode_packet_with_crypto(
         });
     }
     validate_datagram_limit(max_datagram_size)?;
+
+    // 2. 附加加密标志并构造报头
     let flags = packet.flags | PacketFlags::ENCRYPTED;
     let header = header_bytes(
         packet.packet_type,
@@ -53,9 +67,13 @@ pub fn encode_packet_with_crypto(
         packet.packet_number,
         encrypted_payload_len,
     );
+
+    // 3. 执行 AEAD 加密，报头作为附加认证数据（AAD）
     let ciphertext = crypto
         .seal(packet.packet_number, &header, &plaintext)
         .map_err(ProtocolError::Crypto)?;
+
+    // 4. 组装整包并计算 CRC32C 校验和
     let mut output = Vec::with_capacity(FIXED_HEADER_LEN + ciphertext.len());
     output.extend_from_slice(&header);
     output.extend_from_slice(&ciphertext);
@@ -65,6 +83,7 @@ pub fn encode_packet_with_crypto(
     Ok(output)
 }
 
+/// 序列化数据包包含的所有帧
 fn encode_frames(packet: &Packet) -> Result<Vec<u8>, ProtocolError> {
     if packet.frames.is_empty() {
         return Err(ProtocolError::EmptyPacket);
@@ -88,6 +107,7 @@ fn encode_frames(packet: &Packet) -> Result<Vec<u8>, ProtocolError> {
     Ok(payload)
 }
 
+/// 组装报头与载荷并计算写入 CRC32C 校验和
 fn encode_raw_packet(
     packet: &Packet,
     flags: PacketFlags,
@@ -114,11 +134,13 @@ fn encode_raw_packet(
     output.extend_from_slice(&header);
     output.extend_from_slice(payload);
 
+    // 计算 CRC32C 时将 checksum 字段所在的 26..30 字节置零
     let checksum = checksum::crc32c_with_zeroed_range(&output, 26, 30);
     output[26..30].copy_from_slice(&checksum.to_be_bytes());
     Ok(output)
 }
 
+/// 解码明文数据包
 pub fn decode_packet(bytes: &[u8], max_datagram_size: usize) -> Result<Packet, ProtocolError> {
     let header = decode_header_and_lengths(bytes, max_datagram_size)?;
     if header.flags.contains(PacketFlags::ENCRYPTED) {
@@ -127,6 +149,9 @@ pub fn decode_packet(bytes: &[u8], max_datagram_size: usize) -> Result<Packet, P
     decode_plain_packet(bytes, header)
 }
 
+/// 解密并解码加密数据包
+///
+/// 校验报头、CRC32C、解密密文载荷，并更新防重放窗口
 pub fn decode_encrypted_packet(
     bytes: &[u8],
     max_datagram_size: usize,
@@ -144,13 +169,17 @@ pub fn decode_encrypted_packet(
             crate::CryptoError::EncryptedPayloadTooShort,
         ));
     }
+    // 1. 校验 CRC32C
     verify_checksum(bytes, &header)?;
+    // 2. 准备 AAD（报头前 30 字节，其中校验和位置零）
     let mut associated_data = [0_u8; FIXED_HEADER_LEN];
     associated_data.copy_from_slice(&bytes[..FIXED_HEADER_LEN]);
     associated_data[26..30].fill(0);
+    // 3. 执行 AEAD 解密并进行防重放检查
     let plaintext = crypto
         .open(header.packet_number, &associated_data, payload)
         .map_err(ProtocolError::Crypto)?;
+    // 4. 解析明文载荷中的帧
     let frames = decode_frames(&plaintext)?;
     Ok(Packet::new(
         header.packet_type,
@@ -161,6 +190,7 @@ pub fn decode_encrypted_packet(
     ))
 }
 
+/// 快速探查数据报中的 ConnectionId（无需完整解码）
 pub fn peek_connection_id(
     bytes: &[u8],
     max_datagram_size: usize,
@@ -168,6 +198,7 @@ pub fn peek_connection_id(
     Ok(decode_header_and_lengths(bytes, max_datagram_size)?.connection_id)
 }
 
+/// 快速探查数据报中的报头标志位 PacketFlags（无需完整解码）
 pub fn peek_packet_flags(
     bytes: &[u8],
     max_datagram_size: usize,
@@ -175,6 +206,7 @@ pub fn peek_packet_flags(
     Ok(decode_header_and_lengths(bytes, max_datagram_size)?.flags)
 }
 
+/// 解码明文数据包载荷与校验
 fn decode_plain_packet(bytes: &[u8], header: PacketHeader) -> Result<Packet, ProtocolError> {
     verify_checksum(bytes, &header)?;
     let payload = &bytes[usize::from(header.header_len)..];
@@ -191,6 +223,7 @@ fn decode_plain_packet(bytes: &[u8], header: PacketHeader) -> Result<Packet, Pro
     ))
 }
 
+/// 解码报头并核对长度约束
 fn decode_header_and_lengths(
     bytes: &[u8],
     max_datagram_size: usize,
@@ -213,6 +246,7 @@ fn decode_header_and_lengths(
     let header_len = usize::from(header.header_len);
     let payload_len = usize::from(header.payload_len);
     let actual_payload_len = bytes.len() - header_len;
+    // 严格核对报头声明载荷大小与实际剩余字节数一致
     if payload_len != actual_payload_len {
         return Err(ProtocolError::PayloadLengthMismatch {
             declared: payload_len,
@@ -223,6 +257,7 @@ fn decode_header_and_lengths(
     Ok(header)
 }
 
+/// 验证数据包的 CRC32C 校验和
 fn verify_checksum(bytes: &[u8], header: &PacketHeader) -> Result<(), ProtocolError> {
     let expected_checksum = checksum::crc32c_with_zeroed_range(bytes, 26, 30);
     if expected_checksum != header.checksum {
@@ -234,6 +269,7 @@ fn verify_checksum(bytes: &[u8], header: &PacketHeader) -> Result<(), ProtocolEr
     Ok(())
 }
 
+/// 构造定长 30 字节的协议报头切片（未填充校验和）
 fn header_bytes(
     packet_type: PacketType,
     flags: PacketFlags,
@@ -253,6 +289,7 @@ fn header_bytes(
     header
 }
 
+/// 检查数据报总大小未超上限
 fn ensure_datagram_size(actual: usize, maximum: usize) -> Result<(), ProtocolError> {
     if actual > maximum {
         return Err(ProtocolError::DatagramTooLarge { maximum, actual });
@@ -260,6 +297,7 @@ fn ensure_datagram_size(actual: usize, maximum: usize) -> Result<(), ProtocolErr
     Ok(())
 }
 
+/// 从字节数组反序列化 30 字节固定报头并进行基础格式校验
 fn decode_header(bytes: &[u8]) -> Result<PacketHeader, ProtocolError> {
     let magic = u16::from_be_bytes([bytes[0], bytes[1]]);
     if magic != MAGIC {
@@ -302,6 +340,7 @@ fn decode_header(bytes: &[u8]) -> Result<PacketHeader, ProtocolError> {
     })
 }
 
+/// 从载荷字节流中循环解析各个帧
 fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, ProtocolError> {
     let mut offset = 0;
     let mut frames = Vec::new();
@@ -343,6 +382,7 @@ fn decode_frames(payload: &[u8]) -> Result<Vec<Frame>, ProtocolError> {
     Ok(frames)
 }
 
+/// 校验数据报大小限制至少能够容纳报头
 fn validate_datagram_limit(max_datagram_size: usize) -> Result<(), ProtocolError> {
     if max_datagram_size < FIXED_HEADER_LEN {
         return Err(ProtocolError::InvalidValue {
@@ -351,6 +391,7 @@ fn validate_datagram_limit(max_datagram_size: usize) -> Result<(), ProtocolError
     }
     Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {

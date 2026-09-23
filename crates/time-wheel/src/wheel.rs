@@ -8,41 +8,63 @@ use crate::{
     config::WheelConfig, deadline::DeadlineHeap, error::TimerError, id::TimerId, level::Level,
 };
 
+/// 小跨度推进阈值：单次步进滴答数不超过此阈值时走逐滴答级联，超过时触发直接快进（全量重新桶化）
 const SMALL_ADVANCE_LIMIT: u64 = 4096;
 
+/// 时间轮内部存储的任务条目
 struct WheelEntry<T> {
+    /// 任务携带的用户数据
     item: T,
+    /// 任务绝对到期时间（滴答数）
     deadline_tick: u64,
+    /// 当前挂载的时间轮层级索引
     level: u8,
+    /// 当前挂载的槽位索引
     slot: u32,
+    /// 同一槽位双向链表中的前一个任务节点
     prev: Option<DefaultKey>,
+    /// 同一槽位双向链表中的后一个任务节点
     next: Option<DefaultKey>,
+    /// 在全局到期最小堆中的数组下标
     heap_index: usize,
 }
 
+/// 已到期定时器条目，包含 ID、载荷及触发滴答
 pub struct Expired<T> {
     pub id: TimerId,
     pub item: T,
     pub deadline_tick: u64,
 }
 
+/// 时间轮推进执行报告
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdvanceReport {
+    /// 本次实际推进的滴答数
     pub elapsed_ticks: u64,
+    /// 本次触发到期的定时器数量
     pub expired_count: usize,
+    /// 是否采用了快进模式
     pub fast_forwarded: bool,
 }
 
+/// 分层时间轮核心结构体
 pub struct Wheel<T> {
+    /// 任务存储池，以稳定高效的 slotmap 维护节点生命周期
     tasks: SlotMap<DefaultKey, WheelEntry<T>>,
+    /// 全局最早到期最小堆，支持 O(1) 探测最近到期时间
     deadline_heap: DeadlineHeap,
+    /// 多层槽位结构（L0, L1, ...）
     levels: Vec<Level>,
+    /// 当前时间轮全局滴答时钟
     current_tick: u64,
+    /// 累积的亚滴答纳秒残差（不足一个 base_tick 时暂存）
     remainder_nanos: u64,
+    /// 基础滴答时长的纳秒数
     base_tick_nanos: u64,
 }
 
 impl<T> Wheel<T> {
+    /// 根据配置初始化分层时间轮
     pub fn new(config: WheelConfig) -> Self {
         let levels = config
             .levels()
@@ -66,8 +88,11 @@ impl<T> Wheel<T> {
         }
     }
 
+    /// 插入新定时任务，指定延迟时长 `delay`
     pub fn insert(&mut self, item: T, delay: Duration) -> Result<TimerId, TimerError> {
+        // 1. 计算绝对到期滴答
         let deadline_tick = self.deadline_after(delay)?;
+        // 2. 将条目记录到 slotmap 存储池中
         let key = self.tasks.insert(WheelEntry {
             item,
             deadline_tick,
@@ -77,11 +102,13 @@ impl<T> Wheel<T> {
             next: None,
             heap_index: 0,
         });
+        // 3. 计算适合该到期滴答的层级与槽位，并接入该槽位链表
         let (level, slot) = self.determine_location(deadline_tick);
         if let Err(error) = self.link(key, level, slot) {
             self.tasks.remove(key);
             return Err(error);
         }
+        // 4. 将任务同步插入全局到期最小堆
         if let Err(error) = self.insert_deadline(key, deadline_tick) {
             let _ = self.unlink(key);
             self.tasks.remove(key);
@@ -91,19 +118,24 @@ impl<T> Wheel<T> {
         Ok(TimerId::from_key(key))
     }
 
+    /// 重新调度现有定时器（修改延迟时长）
     pub fn reschedule(&mut self, id: TimerId, delay: Duration) -> Result<(), TimerError> {
         let key = id.key();
         if !self.tasks.contains_key(key) {
             return Err(TimerError::StaleTimerId);
         }
+        // 1. 计算新的目标到期滴答
         let deadline_tick = self.deadline_after(delay)?;
+        // 2. 从旧槽位链表摘除
         self.unlink(key)?;
         self.tasks
             .get_mut(key)
             .ok_or(TimerError::StaleTimerId)?
             .deadline_tick = deadline_tick;
+        // 3. 重新计算层级并链入新槽位
         let (level, slot) = self.determine_location(deadline_tick);
         self.link(key, level, slot)?;
+        // 4. 更新最小堆中的节点到期时间
         let heap_index = self
             .tasks
             .get(key)
@@ -114,24 +146,30 @@ impl<T> Wheel<T> {
         Ok(())
     }
 
+    /// 取消指定定时器并返回其关联的用户数据（若定时器不存在或已过期则返回 None）
     pub fn cancel(&mut self, id: TimerId) -> Option<T> {
         let key = id.key();
         if !self.tasks.contains_key(key) {
             return None;
         }
+        // 从所在槽位双向链表中移除
         self.unlink(key).ok()?;
+        // 从最小堆中移除
         let heap_index = self.tasks.get(key)?.heap_index;
         self.remove_deadline(key, heap_index).ok()?;
+        // 从 slotmap 释放并返回数据
         let entry = self.tasks.remove(key)?;
         self.debug_assert_invariants();
         Some(entry.item)
     }
 
+    /// 按流逝时间 `elapsed` 推进时间轮，并将到期的定时器追加至 `expired`
     pub fn advance_by(
         &mut self,
         elapsed: Duration,
         expired: &mut Vec<Expired<T>>,
     ) -> Result<AdvanceReport, TimerError> {
+        // 1. 纳秒转换与残差累加
         let elapsed_nanos: u64 = elapsed
             .as_nanos()
             .try_into()
@@ -150,11 +188,16 @@ impl<T> Wheel<T> {
         self.remainder_nanos = remainder_nanos;
         let expired_start = expired.len();
         let fast_forwarded = elapsed_ticks > SMALL_ADVANCE_LIMIT;
+
+        // 2. 根据步进距离选择推进策略
         if fast_forwarded {
+            // 大跨度跳跃：直接扫描所有存活任务重新分桶，避免庞大的逐滴答级联循环
             self.fast_forward(target_tick, expired)?;
         } else {
+            // 逐滴答步进：先处理当前滴答的高层级联和 L0 槽位
             self.cascade_at_current_tick(expired)?;
             self.process_l0_slot(expired)?;
+            // 逐步推进至 target_tick
             while self.current_tick < target_tick {
                 self.current_tick += 1;
                 self.cascade_at_current_tick(expired)?;
@@ -169,7 +212,9 @@ impl<T> Wheel<T> {
         })
     }
 
+    /// 获取距离下一个定时器到期的剩余时长（若无定时器则返回 Ok(None)）
     pub fn next_deadline(&self) -> Result<Option<Duration>, TimerError> {
+        // 借助最小堆直接在 O(1) 内获取最近到期任务
         let Some(node) = self.deadline_heap.peek() else {
             return if self.tasks.is_empty() {
                 Ok(None)
@@ -187,22 +232,27 @@ impl<T> Wheel<T> {
         self.duration_until_tick(node.deadline_tick).map(Some)
     }
 
+    /// 获取单个基础滴答的时长
     pub fn tick_duration(&self) -> Duration {
         Duration::from_nanos(self.base_tick_nanos)
     }
 
+    /// 获取当前全局滴答计数
     pub fn current_tick(&self) -> u64 {
         self.current_tick
     }
 
+    /// 获取当前时间轮内活动定时器的总数
     pub fn len(&self) -> usize {
         self.tasks.len()
     }
 
+    /// 检查时间轮是否为空
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
 
+    /// 清空时间轮并将其中的所有任务条目收集输出到 `out`
     pub fn clear(&mut self, out: &mut Vec<T>) {
         for level in &mut self.levels {
             level.clear_slots();
@@ -214,11 +264,13 @@ impl<T> Wheel<T> {
         self.debug_assert_invariants();
     }
 
+    /// 计算给定延迟后对应的目标绝对滴答（向上取整，结合当前累积残差）
     fn deadline_after(&self, delay: Duration) -> Result<u64, TimerError> {
         let delay_ticks = if delay.is_zero() {
             0
         } else {
             let offset = delay.as_nanos() + u128::from(self.remainder_nanos);
+            // 向上取整，避免未满一滴答提前到期
             let ticks = offset.div_ceil(u128::from(self.base_tick_nanos));
             ticks.try_into().map_err(|_| TimerError::DelayOverflow)?
         };
@@ -227,9 +279,11 @@ impl<T> Wheel<T> {
             .ok_or(TimerError::DelayOverflow)
     }
 
+    /// 根据目标到期滴答与当前滴答的差值，计算其应安放的层级与槽位索引
     fn determine_location(&self, deadline_tick: u64) -> (usize, usize) {
         let delta = deadline_tick.saturating_sub(self.current_tick);
         let mut selected = self.levels.len() - 1;
+        // 寻找能容纳 delta 的最低层级
         for (index, level) in self.levels.iter().enumerate() {
             if delta < level.span_ticks {
                 selected = index;
@@ -237,10 +291,12 @@ impl<T> Wheel<T> {
             }
         }
         let level = &self.levels[selected];
+        // 根据该层单位步长折算并掩码得到槽位下标
         let slot = ((deadline_tick / level.unit_ticks) as usize) & level.mask;
         (selected, slot)
     }
 
+    /// 将任务节点链接至指定层级与槽位的双向链表尾部
     fn link(
         &mut self,
         key: DefaultKey,
@@ -249,6 +305,7 @@ impl<T> Wheel<T> {
     ) -> Result<(), TimerError> {
         let old_head = self.levels[level_index].slots[slot_index].head;
         if old_head.is_none() {
+            // 当前槽位为空，该节点成为唯一的 head 和 tail
             let slot = &mut self.levels[level_index].slots[slot_index];
             slot.head = Some(key);
             slot.tail = Some(key);
@@ -263,6 +320,7 @@ impl<T> Wheel<T> {
             return Ok(());
         }
 
+        // 槽位非空，追加到链表尾部
         let old_tail = self.levels[level_index].slots[slot_index]
             .tail
             .ok_or(TimerError::InvariantViolation)?;
@@ -282,6 +340,7 @@ impl<T> Wheel<T> {
         Ok(())
     }
 
+    /// 从任务当前所在槽位的双向链表中将其摘除
     fn unlink(&mut self, key: DefaultKey) -> Result<(), TimerError> {
         let (level_index, slot_index, prev, next) = {
             let entry = self.tasks.get(key).ok_or(TimerError::StaleTimerId)?;
@@ -296,6 +355,7 @@ impl<T> Wheel<T> {
             return Err(TimerError::InvariantViolation);
         }
 
+        // 修复前驱节点的 next 指针或槽位 head
         match prev {
             Some(prev) => {
                 self.tasks
@@ -305,6 +365,7 @@ impl<T> Wheel<T> {
             }
             None => self.levels[level_index].slots[slot_index].head = next,
         }
+        // 修复后继节点的 prev 指针或槽位 tail
         match next {
             Some(next) => {
                 self.tasks
@@ -323,11 +384,15 @@ impl<T> Wheel<T> {
         Ok(())
     }
 
+    /// 处理第 0 层（L0）当前滴答槽位中的任务
     fn process_l0_slot(&mut self, expired: &mut Vec<Expired<T>>) -> Result<(), TimerError> {
         let slot_index = (self.current_tick as usize) & self.levels[0].mask;
         self.process_slot(0, slot_index, expired)
     }
 
+    /// 在当前滴答检查并触发高层级联（Cascade）
+    ///
+    /// 当当前滴答是更高层单位步长的倍数时，对应高层槽位已转到触发点，需要将其中的任务重新下移分桶
     fn cascade_at_current_tick(&mut self, expired: &mut Vec<Expired<T>>) -> Result<(), TimerError> {
         for level_index in (1..self.levels.len()).rev() {
             if self
@@ -342,12 +407,14 @@ impl<T> Wheel<T> {
         Ok(())
     }
 
+    /// 处理指定层级和槽位的所有节点：已到期的移入 expired，未到期的重新计算位置降级分桶
     fn process_slot(
         &mut self,
         level_index: usize,
         slot_index: usize,
         expired: &mut Vec<Expired<T>>,
     ) -> Result<(), TimerError> {
+        // 取出整条链表头
         let mut current = {
             let slot = &mut self.levels[level_index].slots[slot_index];
             let head = slot.head.take();
@@ -367,6 +434,7 @@ impl<T> Wheel<T> {
                 .ok_or(TimerError::InvariantViolation)?
                 .deadline_tick;
             if deadline_tick <= self.current_tick {
+                // 已到期：从最小堆和任务表中彻底移除，并收集到 expired
                 let heap_index = self
                     .tasks
                     .get(key)
@@ -383,6 +451,7 @@ impl<T> Wheel<T> {
                     deadline_tick,
                 });
             } else {
+                // 尚未到期：级联降级到更低层级或同层槽位
                 let (new_level, new_slot) = self.determine_location(deadline_tick);
                 self.link(key, new_level, new_slot)?;
             }
@@ -391,6 +460,7 @@ impl<T> Wheel<T> {
         Ok(())
     }
 
+    /// 清空节点的链表指针
     fn detach_entry(&mut self, key: DefaultKey) -> Result<(), TimerError> {
         let entry = self
             .tasks
@@ -401,6 +471,7 @@ impl<T> Wheel<T> {
         Ok(())
     }
 
+    /// 快进模式：当跳过大量滴答时，直接清空所有层级槽位并遍历所有任务重新分桶或到期
     fn fast_forward(
         &mut self,
         target_tick: u64,
@@ -441,6 +512,7 @@ impl<T> Wheel<T> {
         Ok(())
     }
 
+    /// 向最小堆插入到期时间并保持 entry 的 `heap_index` 同步
     fn insert_deadline(&mut self, key: DefaultKey, deadline_tick: u64) -> Result<(), TimerError> {
         let (tasks, deadline_heap) = (&mut self.tasks, &mut self.deadline_heap);
         deadline_heap.insert(key, deadline_tick, |key, index| {
@@ -451,6 +523,7 @@ impl<T> Wheel<T> {
         })
     }
 
+    /// 更新最小堆中的节点到期时间
     fn update_deadline(
         &mut self,
         key: DefaultKey,
@@ -466,6 +539,7 @@ impl<T> Wheel<T> {
         })
     }
 
+    /// 从最小堆中删除节点
     fn remove_deadline(&mut self, key: DefaultKey, heap_index: usize) -> Result<(), TimerError> {
         let (tasks, deadline_heap) = (&mut self.tasks, &mut self.deadline_heap);
         deadline_heap.remove(key, heap_index, |key, index| {
@@ -476,11 +550,13 @@ impl<T> Wheel<T> {
         })
     }
 
+    /// 计算给定目标滴答距离当前时间的实际剩余 Duration
     fn duration_until_tick(&self, deadline_tick: u64) -> Result<Duration, TimerError> {
         if deadline_tick <= self.current_tick {
             return Ok(Duration::ZERO);
         }
         let ticks = deadline_tick - self.current_tick;
+        // 总纳秒 = 滴答数 * base_tick_nanos - 已经累积的残差纳秒
         let nanos = u128::from(ticks)
             .checked_mul(u128::from(self.base_tick_nanos))
             .ok_or(TimerError::DeadlineOverflow)?
@@ -571,6 +647,7 @@ impl<T> Wheel<T> {
     #[cfg(not(debug_assertions))]
     fn debug_assert_invariants(&self) {}
 }
+
 
 #[cfg(test)]
 mod tests {

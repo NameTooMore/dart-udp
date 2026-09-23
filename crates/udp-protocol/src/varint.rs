@@ -1,7 +1,9 @@
 use crate::error::ProtocolError;
 
+/// QUIC 风格变长整数支持的最大值（62 位上限：2^62 - 1）
 pub(crate) const MAX_VALUE: u64 = (1_u64 << 62) - 1;
 
+/// 计算数值按变长整数编码所需的字节数（1、2、4 或 8 字节）
 pub(crate) fn encoded_len(value: u64) -> Result<usize, ProtocolError> {
     if value <= 0x3f {
         Ok(1)
@@ -16,6 +18,13 @@ pub(crate) fn encoded_len(value: u64) -> Result<usize, ProtocolError> {
     }
 }
 
+/// 将 62 位整数按大端变长格式编码追加至输出缓冲区中
+///
+/// 最高 2 bit 用于标识编码长度：
+/// - 00: 1 字节
+/// - 01: 2 字节（带掩码 0x4000）
+/// - 10: 4 字节（带掩码 0x8000_0000）
+/// - 11: 8 字节（带掩码 0xc000_0000_0000_0000）
 pub(crate) fn encode(value: u64, output: &mut Vec<u8>) -> Result<(), ProtocolError> {
     let length = encoded_len(value)?;
     match length {
@@ -28,10 +37,12 @@ pub(crate) fn encode(value: u64, output: &mut Vec<u8>) -> Result<(), ProtocolErr
     Ok(())
 }
 
+/// 从输入字节流当前偏移 `offset` 解析变长整数，并向前推进 `offset`
 pub(crate) fn decode(input: &[u8], offset: &mut usize) -> Result<u64, ProtocolError> {
     let first = *input
         .get(*offset)
         .ok_or(ProtocolError::Truncated { context: "varint" })?;
+    // 首字节高 2 位决定总长度：1 << (first >> 6)，可能为 1, 2, 4, 8 字节
     let length = 1_usize << usize::from(first >> 6);
     let end = offset
         .checked_add(length)
@@ -39,6 +50,7 @@ pub(crate) fn decode(input: &[u8], offset: &mut usize) -> Result<u64, ProtocolEr
     let bytes = input
         .get(*offset..end)
         .ok_or(ProtocolError::Truncated { context: "varint" })?;
+    // 读取对应字节并滤去高 2 位的长度标识位
     let value = match length {
         1 => u64::from(bytes[0] & 0x3f),
         2 => u64::from(u16::from_be_bytes([bytes[0], bytes[1]]) & 0x3fff),
@@ -58,6 +70,7 @@ pub(crate) fn decode(input: &[u8], offset: &mut usize) -> Result<u64, ProtocolEr
     *offset = end;
     Ok(value)
 }
+
 
 #[cfg(test)]
 mod tests {
