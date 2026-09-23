@@ -1,0 +1,18 @@
+[package]
+name = "reliable-udp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+reliable-core.workspace = true
+udp-protocol.workspace = true
+tokio.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
+[lints]
+workspace = true

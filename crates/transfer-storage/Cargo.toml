@@ -1,0 +1,17 @@
+[package]
+name = "transfer-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+blake3.workspace = true
+filetime.workspace = true
+libc.workspace = true
+sha2.workspace = true
+transfer-core.workspace = true
+transfer-protocol.workspace = true
+
+[lints]
+workspace = true

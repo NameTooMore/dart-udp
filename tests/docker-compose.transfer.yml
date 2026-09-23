@@ -1,0 +1,407 @@
+name: udp-transfer-network
+
+x-podman:
+  in_pod: false
+
+x-network-image: &network-image
+  build:
+    context: ..
+    dockerfile: tests/network/Dockerfile
+  image: udp-file-transfer-network:ci
+
+x-client-base: &client-base
+  <<: *network-image
+  privileged: true
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  depends_on:
+    - server
+  entrypoint: ["/usr/local/bin/transfer-network-entrypoint"]
+  volumes:
+    - ${SCENARIO_ARTIFACTS_DIR:-./.artifacts/default}:/artifacts
+  environment:
+    ARTIFACT_DIR: /artifacts
+    SERVER_ENDPOINT: 10.59.0.2:41000
+    SCENARIO: ${SCENARIO:-same-subnet}
+    SCENARIO_SEED: ${SCENARIO_SEED:-20260921}
+
+x-runner-base: &runner-base
+  <<: *network-image
+  depends_on:
+    - server
+  entrypoint: ["/usr/local/bin/transfer-network-entrypoint"]
+  command: ["runner"]
+  volumes:
+    - ${SCENARIO_ARTIFACTS_DIR:-./.artifacts/default}:/artifacts
+  environment:
+    ARTIFACT_DIR: /artifacts
+    SCENARIO: ${SCENARIO:-same-subnet}
+    SCENARIO_TIMEOUT_SECONDS: ${SCENARIO_TIMEOUT_SECONDS:-180}
+
+services:
+  server:
+    <<: *network-image
+    entrypoint: ["/usr/local/bin/transfer-network-entrypoint"]
+    command: ["server"]
+    volumes:
+      - ${SCENARIO_ARTIFACTS_DIR:-./.artifacts/default}:/artifacts
+    environment:
+      ARTIFACT_DIR: /artifacts
+      SERVER_RELAY_MAX_BYTES_PER_SESSION: ${SERVER_RELAY_MAX_BYTES_PER_SESSION:-4294967296}
+      SERVER_RELAY_MAX_BYTES_TOTAL: ${SERVER_RELAY_MAX_BYTES_TOTAL:-0}
+    networks:
+      control_net:
+        ipv4_address: 10.59.0.2
+        aliases:
+          - server
+          - transfer-server
+      relay_net:
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - udp-file --non-interactive --server 127.0.0.1:41000 probe >/dev/null 2>&1
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  # 所有 profile 共用一个 runner，具体客户端通过 profile 选择，避免 runner 自己成为路径的一部分。
+  scenario-runner:
+    <<: *runner-base
+    profiles:
+      - same-subnet
+      - routed-lan
+      - cross-nat-hole-punch
+      - udp-blocked
+      - symmetric-nat
+      - loss-delay
+      - path-failure-resume
+      - ipv6
+      - no-relay
+    networks:
+      control_net:
+
+  client-a-same-subnet:
+    <<: *client-base
+    profiles: [same-subnet]
+    command: ["sender"]
+    networks:
+      control_net:
+      same_subnet_net:
+
+  client-b-same-subnet:
+    <<: *client-base
+    profiles: [same-subnet]
+    command: ["receiver"]
+    networks:
+      control_net:
+      same_subnet_net:
+
+  client-a-routed-lan:
+    <<: *client-base
+    profiles: [routed-lan]
+    command: ["sender"]
+    environment:
+      ROUTE_DESTINATION: 10.61.2.0/24
+      ROUTE_GATEWAY: 10.61.1.1
+    networks:
+      control_net:
+      routed_lan_a:
+        ipv4_address: 10.61.1.10
+
+  client-b-routed-lan:
+    <<: *client-base
+    profiles: [routed-lan]
+    command: ["receiver"]
+    environment:
+      ROUTE_DESTINATION: 10.61.1.0/24
+      ROUTE_GATEWAY: 10.61.2.1
+    networks:
+      control_net:
+      routed_lan_b:
+        ipv4_address: 10.61.2.10
+
+  router-routed-lan:
+    <<: *network-image
+    profiles: [routed-lan]
+    privileged: true
+    cap_add: [NET_ADMIN, NET_RAW]
+    entrypoint: ["/usr/local/bin/transfer-network-entrypoint"]
+    command: ["router"]
+    networks:
+      routed_lan_a:
+        ipv4_address: 10.61.1.1
+      routed_lan_b:
+        ipv4_address: 10.61.2.1
+
+  client-a-cross-nat-hole-punch:
+    <<: *client-base
+    profiles: [cross-nat-hole-punch]
+    command: ["sender"]
+    environment:
+      ROUTE_DESTINATION: 10.62.1.0/24
+      ROUTE_GATEWAY: 10.62.0.2
+    networks:
+      control_net:
+      nat_a_inside:
+        ipv4_address: 10.62.1.10
+
+  client-b-cross-nat-hole-punch:
+    <<: *client-base
+    profiles: [cross-nat-hole-punch]
+    command: ["receiver"]
+    environment:
+      ROUTE_DESTINATION: 10.62.2.0/24
+      ROUTE_GATEWAY: 10.62.0.3
+    networks:
+      control_net:
+      nat_b_inside:
+        ipv4_address: 10.62.2.10
+
+  nat-a-cross-nat-hole-punch:
+    <<: *network-image
+    profiles: [cross-nat-hole-punch]
+    privileged: true
+    cap_add: [NET_ADMIN, NET_RAW]
+    entrypoint: ["/usr/local/bin/transfer-network-entrypoint"]
+    command: ["router"]
+    environment:
+      ROUTER_UPLINK: eth0
+    networks:
+      wan_net:
+        ipv4_address: 10.62.0.2
+      nat_a_inside:
+        ipv4_address: 10.62.1.1
+
+  nat-b-cross-nat-hole-punch:
+    <<: *network-image
+    profiles: [cross-nat-hole-punch]
+    privileged: true
+    cap_add: [NET_ADMIN, NET_RAW]
+    entrypoint: ["/usr/local/bin/transfer-network-entrypoint"]
+    command: ["router"]
+    environment:
+      ROUTER_UPLINK: eth0
+    networks:
+      wan_net:
+        ipv4_address: 10.62.0.3
+      nat_b_inside:
+        ipv4_address: 10.62.2.1
+
+  client-a-udp-blocked:
+    <<: *client-base
+    profiles: [udp-blocked]
+    command: ["sender"]
+    environment:
+      DISABLE_DIRECT: 1
+    networks:
+      control_net:
+      blocked_net:
+        ipv4_address: 10.63.0.10
+
+  client-b-udp-blocked:
+    <<: *client-base
+    profiles: [udp-blocked]
+    command: ["receiver"]
+    environment:
+      DISABLE_DIRECT: 1
+    networks:
+      control_net:
+      blocked_net:
+        ipv4_address: 10.63.0.11
+
+  client-a-symmetric-nat:
+    <<: *client-base
+    profiles: [symmetric-nat]
+    command: ["sender"]
+    environment:
+      DISABLE_DIRECT: 1
+    networks:
+      control_net:
+      symmetric_a:
+        ipv4_address: 10.64.1.10
+
+  client-b-symmetric-nat:
+    <<: *client-base
+    profiles: [symmetric-nat]
+    command: ["receiver"]
+    environment:
+      DISABLE_DIRECT: 1
+    networks:
+      control_net:
+      symmetric_b:
+        ipv4_address: 10.64.2.10
+
+  symmetric-udp-proxy:
+    <<: *network-image
+    profiles: [symmetric-nat]
+    privileged: true
+    cap_add: [NET_ADMIN, NET_RAW]
+    entrypoint: ["/usr/local/bin/transfer-network-entrypoint"]
+    command: ["symmetric-proxy"]
+    networks:
+      symmetric_wan:
+
+  client-a-loss-delay:
+    <<: *client-base
+    profiles: [loss-delay]
+    command: ["sender"]
+    environment:
+      NETEM_SPEC: delay 100ms 20ms loss 10% reorder 20% 50%
+    networks:
+      control_net:
+      loss_delay_net:
+
+  client-b-loss-delay:
+    <<: *client-base
+    profiles: [loss-delay]
+    command: ["receiver"]
+    environment:
+      NETEM_SPEC: delay 100ms 20ms loss 10% reorder 20% 50%
+    networks:
+      control_net:
+      loss_delay_net:
+
+  client-a-path-failure-resume:
+    <<: *client-base
+    profiles: [path-failure-resume]
+    command: ["sender"]
+    networks:
+      control_net:
+      resume_net:
+
+  client-b-path-failure-resume:
+    <<: *client-base
+    profiles: [path-failure-resume]
+    command: ["receiver"]
+    networks:
+      control_net:
+      resume_net:
+
+  client-a-ipv6:
+    <<: *client-base
+    profiles: [ipv6]
+    command: ["sender"]
+    environment:
+      DISABLE_DIRECT: 0
+    networks:
+      control_net:
+      ipv6_net:
+
+  client-b-ipv6:
+    <<: *client-base
+    profiles: [ipv6]
+    command: ["receiver"]
+    environment:
+      DISABLE_DIRECT: 0
+    networks:
+      control_net:
+      ipv6_net:
+
+  client-a-no-relay:
+    <<: *client-base
+    profiles: [no-relay]
+    command: ["sender"]
+    environment:
+      DISABLE_DIRECT: 0
+    networks:
+      control_net:
+      no_relay_net:
+
+  client-b-no-relay:
+    <<: *client-base
+    profiles: [no-relay]
+    command: ["receiver"]
+    environment:
+      DISABLE_DIRECT: 0
+    networks:
+      control_net:
+      no_relay_net:
+
+networks:
+  control_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.59.0.0/24
+  relay_net:
+    driver: bridge
+    internal: true
+  same_subnet_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.60.0.0/24
+  routed_lan_a:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.61.1.0/24
+  routed_lan_b:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.61.2.0/24
+  wan_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.62.0.0/24
+  nat_a_inside:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.62.1.0/24
+  nat_b_inside:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.62.2.0/24
+  blocked_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.63.0.0/24
+  symmetric_a:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.64.1.0/24
+  symmetric_b:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.64.2.0/24
+  symmetric_wan:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.64.0.0/24
+  loss_delay_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.65.0.0/24
+  resume_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.66.0.0/24
+  ipv6_net:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd42:udp:66::/64
+  no_relay_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.67.0.0/24

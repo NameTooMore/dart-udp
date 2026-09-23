@@ -1,0 +1,21 @@
+[package]
+name = "transfer-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+network-probe.workspace = true
+reliable-udp.workspace = true
+tokio.workspace = true
+transfer-core.workspace = true
+transfer-protocol.workspace = true
+transfer-storage.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+transfer-server.workspace = true

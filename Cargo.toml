@@ -1,0 +1,70 @@
+[workspace]
+members = [
+    "crates/time-wheel",
+    "crates/udp-protocol",
+    "crates/reliable-core",
+    "crates/reliable-udp",
+    "crates/transfer-protocol",
+    "crates/transfer-core",
+    "crates/transfer-storage",
+    "crates/network-probe",
+    "crates/transfer-testkit",
+    "crates/transfer-server",
+    "crates/transfer-client",
+    "apps/udp-file-tui",
+    "apps/udp-file-server",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Shao G. <shaogme@gmail.com>"]
+
+[workspace.dependencies]
+
+# Internal Crates
+time-wheel = { path = "crates/time-wheel", version = "0.1.0" }
+udp-protocol = { path = "crates/udp-protocol", version = "0.1.0" }
+reliable-core = { path = "crates/reliable-core", version = "0.1.0" }
+reliable-udp = { path = "crates/reliable-udp", version = "0.1.0" }
+transfer-protocol = { path = "crates/transfer-protocol", version = "0.1.0" }
+transfer-core = { path = "crates/transfer-core", version = "0.1.0" }
+transfer-storage = { path = "crates/transfer-storage", version = "0.1.0" }
+network-probe = { path = "crates/network-probe", version = "0.1.0" }
+transfer-testkit = { path = "crates/transfer-testkit", version = "0.1.0" }
+transfer-server = { path = "crates/transfer-server", version = "0.1.0" }
+transfer-client = { path = "crates/transfer-client", version = "0.1.0" }
+
+getrandom = "0.3"
+hmac = "0.12"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+sha2 = "0.10"
+blake3 = "1.8"
+filetime = "0.2"
+libc = "0.2"
+subtle = "2.6"
+zeroize = "1.8"
+
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+diagweave = { version = "0.5.4", default-features = false }
+
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+ratatui = "0.29"
+crossterm = "0.28"
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+tokio = { version = "1", features = ["full"] }
+slotmap = { version = "1.1.1", default-features = false }
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+cognitive_complexity = { level = "deny", priority = 1 }

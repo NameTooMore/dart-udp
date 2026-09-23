@@ -1,0 +1,56 @@
+# Base configuration for the application
+x-app-base: &app-base
+  image: ghcr.io/shaogme/coding-images/rust-common:latest
+  environment:
+    - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
+    - HOST_UID # Set HOST_UID=host_uid[:host_gid] explicitly; otherwise infer the mounted workspace owner
+    - CONTAINER_HOME=${CONTAINER_HOME:-/home/user} # Unified container home path for root and non-root users
+    - CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0} # Disabled by default for sccache caching compatibility
+    - CARGO_TARGET_DIR=/data/.cargo/target # Isolate Rust target directory to persistent data volume
+    - SCCACHE_DIR=/data/cache/sccache # Directory for sccache compiler cache storage
+    - SCCACHE_DISABLE=${SCCACHE_DISABLE:-0} # Set to 1 to explicitly disable sccache (also supports ENABLE_SCCACHE=0)
+  security_opt:
+    - seccomp:unconfined
+    - apparmor:unconfined
+    - systempaths:unconfined
+  cap_add:
+    - SYS_ADMIN
+    - NET_ADMIN
+    - SYS_PTRACE
+  devices:
+    - /dev/kvm:/dev/kvm # Hardware acceleration for KVM virtualization
+    - /dev/net/tun:/dev/net/tun # Allow TUN/TAP devices for QEMU & Podman to create network interfaces
+    - /dev/fuse:/dev/fuse # Allow fuse-overlayfs inside container
+  tty: true
+
+services:
+  # Develop mode: Mounts local directory for hot-reloading (Default)
+  dev:
+    <<: *app-base
+    container_name: dart-udp-dev
+    volumes:
+      # Mount host source code
+      - .:/workspace
+      - /workspace/.git
+      # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
+      - rust-target:/data/.cargo/target
+      # Persist Cargo dependencies, crate index, and git checkouts
+      - cargo-registry:${CONTAINER_HOME:-/home/user}/.cargo/registry
+      - cargo-git:${CONTAINER_HOME:-/home/user}/.cargo/git
+      # Persist cache
+      - cache:/data/cache
+      # Persist Podman containers and cached cross-compilation toolchain images
+      - podman-containers:/var/lib/containers
+      # Persist devbox data
+      - devbox-data:/data/devbox
+      # Persist unified AI credentials and tool configurations
+      - coding-config:/data/coding-config
+
+volumes:
+  rust-target:
+  cargo-registry:
+  cargo-git:
+  cache:
+  podman-containers:
+  devbox-data:
+  coding-config:

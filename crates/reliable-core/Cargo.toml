@@ -1,0 +1,14 @@
+[package]
+name = "reliable-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+time-wheel.workspace = true
+udp-protocol.workspace = true
+getrandom.workspace = true
+
+[lints]
+workspace = true

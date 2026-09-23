@@ -1,0 +1,13 @@
+[package]
+name = "transfer-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+transfer-core.workspace = true
+transfer-protocol.workspace = true
+
+[lints]
+workspace = true
